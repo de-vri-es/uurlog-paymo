@@ -107,10 +107,12 @@ async fn list_projects(api: &ApiClient) -> Result<(), ()> {
 	}
 
 	for client in &clients {
-		println!("{} ({})", client.name, client.id);
-		let projects = projects_by_client_id.get(&client.id).map(Vec::as_slice).unwrap_or(&[]);
-		for project in projects {
-			println!("  {} ({})", project.name, project.id)
+		let projects = projects_by_client_id.get(&client.id);
+		if let Some(projects) = projects {
+			println!("{} ({})", client.name, client.id);
+			for project in projects {
+				println!("  {} ({})", project.name, project.id)
+			}
 		}
 	}
 
