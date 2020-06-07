@@ -91,7 +91,10 @@ async fn list_projects(api: &ApiClient) -> Result<(), ()> {
 	clients.sort_by(|a, b| a.name.cmp(&b.name));
 
 	let mut projects_by_client_id = BTreeMap::new();
-	let projects = api.get_projects().await.map_err(|e| eprintln!("{}", e))?;
+	let filter = api_client::ProjectsFilter {
+		active: Some(true),
+	};
+	let projects = api.get_projects(&filter).await.map_err(|e| eprintln!("{}", e))?;
 	for project in projects {
 		match projects_by_client_id.entry(project.client_id) {
 			Vacant(entry) => {
