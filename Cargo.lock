@@ -992,7 +992,7 @@ dependencies = [
 [[package]]
 name = "uurlog"
 version = "0.1.0"
-source = "git+https://github.com/de-vri-es/uurlog#fd877ca0fe953dd0882dead48c75c6018c6d85d8"
+source = "git+https://github.com/de-vri-es/uurlog#8fed2305fb19b63419facd3e9941b6d2a8d6f7cf"
 
 [[package]]
 name = "uurlog-paymo"

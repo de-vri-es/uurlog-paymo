@@ -17,7 +17,7 @@ impl ApiClient {
 		Ok(response.clients)
 	}
 
-	pub async fn get_projects(&self, filter: &ProjectsFilter) -> Result<Vec<types::Project>, String> {
+	pub async fn get_projects_filtered(&self, filter: &ProjectsFilter) -> Result<Vec<types::Project>, String> {
 		#[derive(serde::Deserialize)]
 		struct Response {
 			projects: Vec<types::Project>,
@@ -25,6 +25,20 @@ impl ApiClient {
 
 		let response : Response = self.get_auth("projects", &filter.build_query()).await?;
 		Ok(response.projects)
+	}
+
+	pub async fn get_projects(&self) -> Result<Vec<types::Project>, String> {
+		self.get_projects_filtered(&ProjectsFilter::default()).await
+	}
+
+	pub async fn get_tasks(&self) -> Result<Vec<types::Task>, String> {
+		#[derive(serde::Deserialize)]
+		struct Response {
+			tasks: Vec<types::Task>,
+		}
+
+		let response : Response = self.get_auth("tasks", "").await?;
+		Ok(response.tasks)
 	}
 
 	async fn get_auth<T: serde::de::DeserializeOwned>(&self, relative_url: &str, query: &str) -> Result<T, String> {
@@ -43,6 +57,7 @@ impl ApiClient {
 	}
 }
 
+#[derive(Debug, Default)]
 pub struct ProjectsFilter {
 	pub active: Option<bool>,
 }

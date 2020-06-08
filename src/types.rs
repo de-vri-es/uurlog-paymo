@@ -39,3 +39,23 @@ pub struct Project {
 	pub created_on: String,
 	pub updated_on: String,
 }
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct Task {
+	pub id: u64,
+	pub name: String,
+	pub code: String,
+	pub project_id: u64,
+	pub tasklist_id: u64,
+	pub user_id: u64,
+	pub complete: bool,
+	pub billable: bool,
+	pub seq: u64,
+	pub description: String,
+	pub price_per_hour: Option<f64>,
+	pub due_date: Option<String>,
+	pub budget_hours: Option<f64>,
+	pub users: Vec<u64>,
+	pub created_on: String,
+	pub updated_on: String,
+}

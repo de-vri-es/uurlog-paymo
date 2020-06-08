@@ -21,18 +21,10 @@ struct Options {
 
 	#[structopt(long)]
 	#[structopt(group = "action")]
-	list_clients: bool,
-
-	#[structopt(long)]
-	#[structopt(group = "action")]
-	list_projects: bool,
+	list_tasks: bool,
 
 	#[structopt(short, long)]
 	token: PathBuf,
-
-	#[structopt(long)]
-	#[structopt(requires = "list-projects")]
-	client: Option<String>,
 
 	#[structopt(long)]
 	#[structopt(default_value = "https://app.paymoapp.com/api")]
@@ -65,26 +57,14 @@ async fn do_main(options: Options) -> Result<(), ()> {
 
 	if let Some(file) = &options.upload {
 		upload(&api, &file).await
-	} else if options.list_clients {
-		list_clients(&api).await
-	} else if options.list_projects {
-		list_projects(&api).await
+	} else if options.list_tasks {
+		list_tasks(&api).await
 	} else {
 		unreachable!("no action selected");
 	}
 }
 
-async fn list_clients(api: &ApiClient) -> Result<(), ()> {
-	let mut clients = api.get_clients().await.map_err(|e| eprintln!("{}", e))?;
-	clients.sort_by(|a, b| a.name.cmp(&b.name));
-
-	for client in &clients {
-		println!("{} ({})", client.name, client.id);
-	}
-	Ok(())
-}
-
-async fn list_projects(api: &ApiClient) -> Result<(), ()> {
+async fn list_tasks(api: &ApiClient) -> Result<(), ()> {
 	use std::collections::btree_map::Entry::{Occupied, Vacant};
 
 	let mut clients = api.get_clients().await.map_err(|e| eprintln!("{}", e))?;
@@ -94,7 +74,7 @@ async fn list_projects(api: &ApiClient) -> Result<(), ()> {
 	let filter = api_client::ProjectsFilter {
 		active: Some(true),
 	};
-	let projects = api.get_projects(&filter).await.map_err(|e| eprintln!("{}", e))?;
+	let projects = api.get_projects_filtered(&filter).await.map_err(|e| eprintln!("{}", e))?;
 	for project in projects {
 		match projects_by_client_id.entry(project.client_id) {
 			Vacant(entry) => {
@@ -106,12 +86,31 @@ async fn list_projects(api: &ApiClient) -> Result<(), ()> {
 		}
 	}
 
+	let mut tasks_by_project_id = BTreeMap::new();
+	let tasks = api.get_tasks().await.map_err(|e| eprintln!("{}", e))?;
+	for task in tasks {
+		match tasks_by_project_id.entry(task.project_id) {
+			Vacant(entry) => {
+				entry.insert(vec![task]);
+			},
+			Occupied(mut entry) => {
+				entry.get_mut().push(task);
+			},
+		}
+	}
+
 	for client in &clients {
 		let projects = projects_by_client_id.get(&client.id);
 		if let Some(projects) = projects {
 			println!("{} ({})", client.name, client.id);
 			for project in projects {
-				println!("  {} ({})", project.name, project.id)
+				println!("  {} ({})", project.name, project.id);
+				let tasks = tasks_by_project_id.get(&project.id).map(|x| x.as_slice()).unwrap_or_else(|| &[]);
+				for task in tasks {
+					if !task.complete {
+						println!("    {} ({})", task.name, task.id);
+					}
+				}
 			}
 		}
 	}
@@ -123,5 +122,93 @@ async fn upload(api: &ApiClient, file: &Path) -> Result<(), ()> {
 	let entries = uurlog::parse_file(file)
 		.map_err(|e| eprintln!("Failed to read {}: {}", file.display(), e))?;
 
+	let clients = api.get_clients().await.map_err(|e| eprintln!("{}", e))?;
+	let projects = api.get_projects().await.map_err(|e| eprintln!("{}", e))?;
+	let tasks = api.get_tasks().await.map_err(|e| eprintln!("{}", e))?;
+
+	for entry in &entries {
+		let project = if entry.tags.len() == 1 {
+			find_unique_matching_task(&entry.tags[0], &tasks, &projects, &clients)?
+		} else if entry.tags.len() == 0 {
+			eprintln!("entry has no tags, unable to determine project/task");
+			eprintln!("  {}", entry);
+			return Err(());
+		} else {
+			eprintln!("entry has multiple tags, unable to determine project/task");
+			eprintln!("  {}", entry);
+			return Err(());
+		};
+
+
+		eprintln!("{} -> {} ({})", entry, project.name, project.id);
+	}
+
 	todo!();
+}
+
+fn find_unique_matching_task<'a>(tag: &str, tasks: &'a [types::Task], projects: &[types::Project], clients: &[types::Client]) -> Result<&'a types::Task, ()> {
+	let fields : Vec<_> = tag.split("/").collect();
+	let (client, project, name) = match fields.len() {
+		2 => (None, fields[0], fields[1]),
+		3 => (Some(fields[0]), fields[1], fields[2]),
+		_ => {
+			eprintln!("failed to parse tag: expected [Client/]Project/Task, got {:?}", tag);
+			return Err(());
+		}
+	};
+
+	let client = match client {
+		None => None,
+		Some(name) => Some(find_unique_matching_client(name, clients)?.id),
+	};
+
+	let project = find_unique_matching_project(project, client, projects)?.id;
+
+	let matching_tasks : Vec<_> = tasks
+		.iter()
+		.filter(|task| task.project_id == project && task.name.eq_ignore_ascii_case(name))
+		.collect();
+
+	if matching_tasks.len() == 1 {
+		Ok(matching_tasks[0])
+	} else if matching_tasks.is_empty() {
+		eprintln!("no matching task found for {:?}", tag);
+		Err(())
+	} else {
+		eprintln!("found multiple matching tasks for {:?}", tag);
+		Err(())
+	}
+}
+
+fn find_unique_matching_project<'a>(name: &str, client_id: Option<u64>, projects: &'a [types::Project]) -> Result<&'a types::Project, ()> {
+	let matching_projects : Vec<_> = projects
+		.iter()
+		.filter(|project| client_id.map(|id| project.client_id == id).unwrap_or(true) && project.name.eq_ignore_ascii_case(name))
+		.collect();
+
+	if matching_projects.len() == 1 {
+		Ok(matching_projects[0])
+	} else if matching_projects.is_empty() {
+		eprintln!("no matching projects found for {:?}", name);
+		Err(())
+	} else {
+		eprintln!("found multiple matching projects for {:?}", name);
+		Err(())
+	}
+}
+
+fn find_unique_matching_client<'a>(name: &str, clients: &'a [types::Client]) -> Result<&'a types::Client, ()> {
+	let matching_clients : Vec<_> = clients
+		.iter()
+		.filter(|client| client.name.eq_ignore_ascii_case(name))
+		.collect();
+	if matching_clients.len() == 1 {
+		Ok(matching_clients[0])
+	} else if matching_clients.is_empty() {
+		eprintln!("no matching clients found for {:?}", name);
+		Err(())
+	} else {
+		eprintln!("found multiple matching clients for {:?}", name);
+		Err(())
+	}
 }
