@@ -5,6 +5,7 @@ use structopt::clap;
 
 mod api_client;
 mod types;
+mod parse_tasks;
 
 use api_client::ApiClient;
 
@@ -15,9 +16,14 @@ use api_client::ApiClient;
 #[structopt(group = clap::ArgGroup::with_name("action").required(true))]
 struct Options {
 	#[structopt(short, long)]
-	#[structopt(group = "action")]
 	#[structopt(value_name = "FILE")]
+	#[structopt(requires = "task-ids")]
+	#[structopt(group = "action")]
 	upload: Option<PathBuf>,
+
+	#[structopt(long)]
+	#[structopt(value_name = "FILE")]
+	task_ids: Option<PathBuf>,
 
 	#[structopt(long)]
 	#[structopt(group = "action")]
@@ -56,7 +62,7 @@ async fn do_main(options: Options) -> Result<(), ()> {
 	};
 
 	if let Some(file) = &options.upload {
-		upload(&api, &file).await
+		upload(&api, &file, &options.task_ids.unwrap()).await
 	} else if options.list_tasks {
 		list_tasks(&api).await
 	} else {
@@ -65,39 +71,17 @@ async fn do_main(options: Options) -> Result<(), ()> {
 }
 
 async fn list_tasks(api: &ApiClient) -> Result<(), ()> {
-	use std::collections::btree_map::Entry::{Occupied, Vacant};
-
 	let mut clients = api.get_clients().await.map_err(|e| eprintln!("{}", e))?;
 	clients.sort_by(|a, b| a.name.cmp(&b.name));
 
-	let mut projects_by_client_id = BTreeMap::new();
 	let filter = api_client::ProjectsFilter {
 		active: Some(true),
 	};
 	let projects = api.get_projects_filtered(&filter).await.map_err(|e| eprintln!("{}", e))?;
-	for project in projects {
-		match projects_by_client_id.entry(project.client_id) {
-			Vacant(entry) => {
-				entry.insert(vec![project]);
-			},
-			Occupied(mut entry) => {
-				entry.get_mut().push(project);
-			},
-		}
-	}
+	let projects_by_client_id = index_by(projects, |x| x.client_id);
 
-	let mut tasks_by_project_id = BTreeMap::new();
 	let tasks = api.get_tasks().await.map_err(|e| eprintln!("{}", e))?;
-	for task in tasks {
-		match tasks_by_project_id.entry(task.project_id) {
-			Vacant(entry) => {
-				entry.insert(vec![task]);
-			},
-			Occupied(mut entry) => {
-				entry.get_mut().push(task);
-			},
-		}
-	}
+	let tasks_by_project_id = index_by(tasks, |x| x.project_id);
 
 	for client in &clients {
 		let projects = projects_by_client_id.get(&client.id);
@@ -118,17 +102,78 @@ async fn list_tasks(api: &ApiClient) -> Result<(), ()> {
 	Ok(())
 }
 
-async fn upload(api: &ApiClient, file: &Path) -> Result<(), ()> {
+async fn upload(api: &ApiClient, file: &Path, task_ids: &Path) -> Result<(), ()> {
 	let entries = uurlog::parse_file(file)
 		.map_err(|e| eprintln!("Failed to read {}: {}", file.display(), e))?;
 
-	let clients = api.get_clients().await.map_err(|e| eprintln!("{}", e))?;
-	let projects = api.get_projects().await.map_err(|e| eprintln!("{}", e))?;
-	let tasks = api.get_tasks().await.map_err(|e| eprintln!("{}", e))?;
+	let task_ids = parse_tasks::read_task_ids(task_ids)
+		.map_err(|e| eprintln!("Failed to read task IDs from {}: {}", task_ids.display(), e))?;
 
-	for entry in &entries {
-		let project = if entry.tags.len() == 1 {
-			find_unique_matching_task(&entry.tags[0], &tasks, &projects, &clients)?
+	let user = api.my_user().await
+		.map_err(|e| eprintln!("Failed to determine user ID: {}", e))?;
+
+	let entries_with_tasks = get_tasks_with_entries(&entries, &task_ids)?;
+	let entries_by_date = index_by(entries_with_tasks, |(entry, _task_id)| entry.date);
+
+	let mut delete_entries = Vec::new();
+	let mut post_entries = Vec::new();
+
+	for (date, mut new_entries) in entries_by_date {
+		eprintln!("Processing {}", date);
+
+		let old_entries = api.get_time_entries(&api_client::TimeEntryFilter::new().user_id(user.id).date(date))
+			.await
+			.map_err(|e| eprintln!("failed to get time entries for {}: {}", date, e))?;
+
+		tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+
+		for old_entry in &old_entries {
+			// Skip old entries with start/end time.
+			if old_entry.date.is_none() {
+				continue;
+			}
+
+			let matching_index = new_entries
+				.iter()
+				.position(|(new_entry, _task_id)| {
+					new_entry.description == old_entry.description
+					&& new_entry.hours.total_minutes() * 60 == old_entry.duration
+				});
+			if let Some(matching_index) = matching_index {
+				new_entries.remove(matching_index);
+			} else {
+				delete_entries.push(old_entry.id);
+			}
+		}
+
+		post_entries.extend(new_entries);
+	}
+
+	for &delete_entry in &delete_entries {
+		println!("Deleting entry {}", delete_entry);
+		api.delete_entry(delete_entry)
+			.await
+			.map_err(|e| eprintln!("{}", e))?;
+		tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+	}
+
+	for &(entry, task_id) in &post_entries {
+		println!("Adding entry with task id {}: {}", task_id, entry);
+		api.add_entry(task_id, entry.date, entry.hours, &entry.description)
+			.await
+			.map_err(|e| eprintln!("{}", e))?;
+		tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+	}
+
+	Ok(())
+}
+
+fn get_tasks_with_entries<'a>(entries: &'a [uurlog::Entry], task_ids: &BTreeMap<String, u64>) -> Result<Vec<(&'a uurlog::Entry, u64)>, ()> {
+	let mut result = Vec::new();
+
+	for entry in entries {
+		let task_id = if entry.tags.len() == 1 {
+			task_ids.get(&entry.tags[0]).ok_or_else(|| eprintln!("unknown task ID for tag: {}", entry.tags[0]))?
 		} else if entry.tags.len() == 0 {
 			eprintln!("entry has no tags, unable to determine project/task");
 			eprintln!("  {}", entry);
@@ -139,76 +184,30 @@ async fn upload(api: &ApiClient, file: &Path) -> Result<(), ()> {
 			return Err(());
 		};
 
-
-		eprintln!("{} -> {} ({})", entry, project.name, project.id);
+		result.push((entry, *task_id));
 	}
 
-	todo!();
+	Ok(result)
 }
 
-fn find_unique_matching_task<'a>(tag: &str, tasks: &'a [types::Task], projects: &[types::Project], clients: &[types::Client]) -> Result<&'a types::Task, ()> {
-	let fields : Vec<_> = tag.split("/").collect();
-	let (client, project, name) = match fields.len() {
-		2 => (None, fields[0], fields[1]),
-		3 => (Some(fields[0]), fields[1], fields[2]),
-		_ => {
-			eprintln!("failed to parse tag: expected [Client/]Project/Task, got {:?}", tag);
-			return Err(());
+fn index_by<I, F, T, K>(input: I, mut key: F) -> BTreeMap<K, Vec<T>>
+where
+	I: IntoIterator<Item = T>,
+	F: FnMut(&T) -> K,
+	K: std::cmp::Ord,
+{
+	use std::collections::btree_map::Entry;
+	let mut result = BTreeMap::new();
+	for item in input {
+		match result.entry(key(&item)) {
+			Entry::Vacant(entry) => {
+				entry.insert(vec![item]);
+			},
+			Entry::Occupied(mut entry) => {
+				entry.get_mut().push(item);
+			},
 		}
-	};
-
-	let client = match client {
-		None => None,
-		Some(name) => Some(find_unique_matching_client(name, clients)?.id),
-	};
-
-	let project = find_unique_matching_project(project, client, projects)?.id;
-
-	let matching_tasks : Vec<_> = tasks
-		.iter()
-		.filter(|task| task.project_id == project && task.name.eq_ignore_ascii_case(name))
-		.collect();
-
-	if matching_tasks.len() == 1 {
-		Ok(matching_tasks[0])
-	} else if matching_tasks.is_empty() {
-		eprintln!("no matching task found for {:?}", tag);
-		Err(())
-	} else {
-		eprintln!("found multiple matching tasks for {:?}", tag);
-		Err(())
 	}
-}
 
-fn find_unique_matching_project<'a>(name: &str, client_id: Option<u64>, projects: &'a [types::Project]) -> Result<&'a types::Project, ()> {
-	let matching_projects : Vec<_> = projects
-		.iter()
-		.filter(|project| client_id.map(|id| project.client_id == id).unwrap_or(true) && project.name.eq_ignore_ascii_case(name))
-		.collect();
-
-	if matching_projects.len() == 1 {
-		Ok(matching_projects[0])
-	} else if matching_projects.is_empty() {
-		eprintln!("no matching projects found for {:?}", name);
-		Err(())
-	} else {
-		eprintln!("found multiple matching projects for {:?}", name);
-		Err(())
-	}
-}
-
-fn find_unique_matching_client<'a>(name: &str, clients: &'a [types::Client]) -> Result<&'a types::Client, ()> {
-	let matching_clients : Vec<_> = clients
-		.iter()
-		.filter(|client| client.name.eq_ignore_ascii_case(name))
-		.collect();
-	if matching_clients.len() == 1 {
-		Ok(matching_clients[0])
-	} else if matching_clients.is_empty() {
-		eprintln!("no matching clients found for {:?}", name);
-		Err(())
-	} else {
-		eprintln!("found multiple matching clients for {:?}", name);
-		Err(())
-	}
+	result
 }

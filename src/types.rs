@@ -1,6 +1,39 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct User {
+	pub id: u64,
+	pub name: String,
+	pub email: String,
+	#[serde(rename = "type")]
+	pub kind: String,
+	pub active: bool,
+	pub timezone: String,
+	pub phone: String,
+	pub skype: Option<String>,
+	pub position: String,
+	pub workday_hours: Option<f64>,
+	pub price_per_hour: Option<f64>,
+	pub image: Option<String>,
+	pub image_thumb_large: Option<String>,
+	pub image_thumb_medium: Option<String>,
+	pub image_thumb_small: Option<String>,
+	pub date_format: String,
+	pub time_format: String,
+	pub decimal_sep: String,
+	pub thousands_sep: String,
+	pub week_start: String,
+	pub language: String,
+	pub theme: String,
+	pub assigned_projects: Vec<u64>,
+	pub managed_projects: Vec<u64>,
+	pub is_online: bool,
+	pub password: Option<String>,
+	pub created_on: String,
+	pub updated_on: String,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct Client {
 	pub id: u64,
 	pub name: String,
@@ -56,6 +89,25 @@ pub struct Task {
 	pub due_date: Option<String>,
 	pub budget_hours: Option<f64>,
 	pub users: Vec<u64>,
+	pub created_on: String,
+	pub updated_on: String,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+pub struct TimeEntry {
+	pub id: u64,
+	pub task_id: u64,
+	pub user_id: u64,
+	pub start_time: Option<String>,
+	pub end_time: Option<String>,
+	pub description: String,
+	pub added_manually: bool,
+	pub invoice_item_id: Option<u64>,
+	pub billed: bool,
+	pub is_bulk: bool,
+	pub project_id: u64,
+	pub duration: u32,
+	pub date: Option<String>,
 	pub created_on: String,
 	pub updated_on: String,
 }
