@@ -137,6 +137,7 @@ async fn sync_to_paymo(api: &ApiClient, file: &Path, task_ids: &Path) -> Result<
 		eprintln!("Processing {}", date);
 
 		// Get the entries for the right date.
+		// TODO: Be faster by getting all entries for the right time interval in one request.
 		let old_entries = api.get_time_entries(&api_client::TimeEntryFilter::new().user_id(user.id).date(date))
 			.await
 			.map_err(|e| eprintln!("failed to get time entries for {}: {}", date, e))?;
