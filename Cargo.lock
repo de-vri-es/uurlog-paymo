@@ -998,7 +998,7 @@ checksum = "3df3561629a8bb4c57e5a2e4c43348d9e29c7c29d9b1c4c1f47166deca8f37ed"
 [[package]]
 name = "uurlog"
 version = "0.1.0"
-source = "git+https://github.com/de-vri-es/uurlog#741578911de52e3f85d4ae4b1ceec8baa033b5d0"
+source = "git+https://github.com/de-vri-es/uurlog#afeb6e7b27a56bd542488a220e7a8b5ee19552ee"
 
 [[package]]
 name = "uurlog-paymo"

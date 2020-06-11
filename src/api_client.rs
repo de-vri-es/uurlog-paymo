@@ -238,5 +238,5 @@ impl FilterBuilder {
 }
 
 fn to_time_interval(date: uurlog::Date) -> String {
-	format!("(\"{}T00:00:00Z\", \"{}T00:00:00Z\")", date, date.next_day())
+	format!("(\"{}T00:00:00Z\", \"{}T00:00:00Z\")", date, date.next())
 }
