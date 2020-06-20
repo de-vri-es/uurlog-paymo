@@ -89,6 +89,7 @@ impl ApiClient {
 	}
 
 	async fn get<T: serde::de::DeserializeOwned>(&self, relative_url: &str, query: &str) -> Result<T, String> {
+		log::debug!("GET {}/{}?{}", self.api_root, relative_url, query);
 		let client = reqwest::Client::new();
 		let response = client.get(&format!("{}/{}?{}", self.api_root, relative_url, query))
 			.basic_auth(&self.auth_token, Some(""))
@@ -106,6 +107,7 @@ impl ApiClient {
 	}
 
 	async fn post_new(&self, relative_url: &str, body: &impl serde::Serialize) -> Result<(), String> {
+		log::debug!("POST {}/{}", self.api_root, relative_url);
 		let client = reqwest::Client::new();
 		let response = client.post(&format!("{}/{}", self.api_root, relative_url))
 			.basic_auth(&self.auth_token, Some(""))
@@ -115,13 +117,14 @@ impl ApiClient {
 			.map_err(|e| format!("failed to get {}: error sending request: {}", relative_url, e))?;
 
 		if response.status() != StatusCode::CREATED {
-			Err(format!("failed to get {}: served responded with status code {:?}", relative_url, response.status()))
+			Err(format!("failed to post {}: served responded with status code {:?}", relative_url, response.status()))
 		} else {
 			Ok(())
 		}
 	}
 
 	async fn delete(&self, relative_url: &str, id: u64) -> Result<(), String> {
+		log::debug!("DELETE {}/{}/{}", self.api_root, relative_url, id);
 		let client = reqwest::Client::new();
 		let response = client.delete(&format!("{}/{}/{}", self.api_root, relative_url, id))
 			.basic_auth(&self.auth_token, Some(""))

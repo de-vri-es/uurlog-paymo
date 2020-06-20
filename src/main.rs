@@ -15,7 +15,11 @@ use api_client::ApiClient;
 #[structopt(setting = clap::AppSettings::ColoredHelp)]
 #[structopt(group = clap::ArgGroup::with_name("action").required(true))]
 struct Options {
-	#[structopt(short, long)]
+	#[structopt(long, short)]
+	#[structopt(parse(from_occurrences))]
+	verbose: i8,
+
+	#[structopt(long)]
 	#[structopt(value_name = "FILE")]
 	#[structopt(requires = "task-ids")]
 	#[structopt(group = "action")]
@@ -58,9 +62,27 @@ fn read_file(path: impl AsRef<Path>) -> std::io::Result<String> {
 	Ok(data)
 }
 
+fn init_logging(verbosity: i8) {
+	let level = if verbosity <= -2 {
+		log::LevelFilter::Error
+	} else if verbosity == -1 {
+		log::LevelFilter::Warn
+	} else if verbosity == 0 {
+		log::LevelFilter::Info
+	} else if verbosity == 1 {
+		log::LevelFilter::Debug
+	} else {
+		log::LevelFilter::Trace
+	};
+
+	env_logger::from_env("RUST_LOG").filter_module("uurlog_paymo", level).init();
+}
+
 async fn do_main(options: Options) -> Result<(), ()> {
+	init_logging(options.verbose);
+
 	let token = read_file(&options.token)
-		.map_err(|e| eprintln!("failed to read token from {}: {}", options.token.display(), e))?;
+		.map_err(|e| log::error!("failed to read token from {}: {}", options.token.display(), e))?;
 
 	let api = ApiClient {
 		api_root: options.api_root,
@@ -77,18 +99,18 @@ async fn do_main(options: Options) -> Result<(), ()> {
 }
 
 async fn list_tasks(api: &ApiClient) -> Result<(), ()> {
-	let mut clients = api.get_clients().await.map_err(|e| eprintln!("{}", e))?;
+	let mut clients = api.get_clients().await.map_err(|e| log::error!("{}", e))?;
 	clients.sort_by(|a, b| a.name.cmp(&b.name));
 
 	// Get all active projects, and index them by client ID.
 	let filter = api_client::ProjectsFilter {
 		active: Some(true),
 	};
-	let projects = api.get_projects_filtered(&filter).await.map_err(|e| eprintln!("{}", e))?;
+	let projects = api.get_projects_filtered(&filter).await.map_err(|e| log::error!("{}", e))?;
 	let projects_by_client_id = index_by(projects, |x| x.client_id);
 
 	// Get all tasks, and index them by project ID.
-	let tasks = api.get_tasks().await.map_err(|e| eprintln!("{}", e))?;
+	let tasks = api.get_tasks().await.map_err(|e| log::error!("{}", e))?;
 	let tasks_by_project_id = index_by(tasks, |x| x.project_id);
 
 	// Print a tree of clients -> projects -> tasks.
@@ -199,14 +221,14 @@ fn get_tasks_with_entries<'a>(entries: &'a [uurlog::Entry], task_ids: &BTreeMap<
 
 	for entry in entries {
 		let task_id = if entry.tags.len() == 1 {
-			task_ids.get(&entry.tags[0]).ok_or_else(|| eprintln!("unknown task ID for tag: {}", entry.tags[0]))?
+			task_ids.get(&entry.tags[0]).ok_or_else(|| log::error!("unknown task ID for tag: {}", entry.tags[0]))?
 		} else if entry.tags.len() == 0 {
-			eprintln!("entry has no tags, unable to determine project/task");
-			eprintln!("  {}", entry);
+			log::error!("entry has no tags, unable to determine project/task");
+			log::error!("  {}", entry);
 			return Err(());
 		} else {
-			eprintln!("entry has multiple tags, unable to determine project/task");
-			eprintln!("  {}", entry);
+			log::error!("entry has multiple tags, unable to determine project/task");
+			log::error!("  {}", entry);
 			return Err(());
 		};
 
