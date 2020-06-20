@@ -74,6 +74,7 @@ impl ApiClient {
 		Ok(response.projects)
 	}
 
+	#[allow(dead_code)]
 	pub async fn get_projects(&self) -> Result<Vec<types::Project>, String> {
 		self.get_projects_filtered(&ProjectsFilter::default()).await
 	}
@@ -159,7 +160,7 @@ pub struct TimeEntryFilter {
 	pub task_id: Option<u64>,
 	pub project_id: Option<u64>,
 	pub client_id: Option<u64>,
-	pub date: Option<uurlog::Date>,
+	pub period: Option<std::ops::Range<uurlog::Date>>,
 }
 
 impl TimeEntryFilter {
@@ -173,7 +174,7 @@ impl TimeEntryFilter {
 		builder.test_equal("task_id", self.task_id);
 		builder.test_equal("project_id", self.project_id);
 		builder.test_equal("client_id", self.client_id);
-		builder.test_in("time_interval", self.date.map(to_time_interval));
+		builder.test_in("time_interval", self.period.as_ref().map(to_time_interval));
 		builder.finish()
 	}
 
@@ -182,23 +183,26 @@ impl TimeEntryFilter {
 		self
 	}
 
+	#[allow(dead_code)]
 	pub fn task_id(mut self, val: u64) -> Self {
 		self.task_id = Some(val);
 		self
 	}
 
+	#[allow(dead_code)]
 	pub fn project_id(mut self, val: u64) -> Self {
 		self.project_id = Some(val);
 		self
 	}
 
+	#[allow(dead_code)]
 	pub fn client_id(mut self, val: u64) -> Self {
 		self.client_id = Some(val);
 		self
 	}
 
-	pub fn date(mut self, val: uurlog::Date) -> Self {
-		self.date = Some(val);
+	pub fn period(mut self, val: std::ops::Range<uurlog::Date>) -> Self {
+		self.period = Some(val);
 		self
 	}
 }
@@ -240,6 +244,6 @@ impl FilterBuilder {
 	}
 }
 
-fn to_time_interval(date: uurlog::Date) -> String {
-	format!("(\"{}T00:00:00Z\", \"{}T00:00:00Z\")", date, date.next())
+fn to_time_interval(period: &std::ops::Range<uurlog::Date>) -> String {
+	format!("(\"{}T00:00:00Z\", \"{}T00:00:00Z\")", period.start, period.end)
 }

@@ -4,10 +4,12 @@ use structopt::StructOpt;
 use structopt::clap;
 
 mod api_client;
-mod types;
 mod parse_tasks;
+mod partial_date;
+mod types;
 
 use api_client::ApiClient;
+use partial_date::PartialDate;
 
 #[derive(StructOpt)]
 #[structopt(setting = clap::AppSettings::DeriveDisplayOrder)]
@@ -19,30 +21,40 @@ struct Options {
 	#[structopt(parse(from_occurrences))]
 	verbose: i8,
 
+	/// Synchronize logged hours to Paymo.
 	#[structopt(long)]
 	#[structopt(value_name = "FILE")]
 	#[structopt(requires = "task-ids")]
+	#[structopt(requires = "period")]
 	#[structopt(group = "action")]
-	/// Synchronize logged hours to Paymo.
 	sync: Option<PathBuf>,
 
+	/// The period to synchronize.
+	#[structopt(value_name = "YYYY[-MM[-DD]]")]
+	#[structopt(long)]
+	period: Option<PartialDate>,
+
+	/// Print what would be done, without changing any entries on Paymo.
+	#[structopt(long)]
+	dry_run: bool,
+
+	/// Read tag to task ID mapping from this file.
 	#[structopt(long)]
 	#[structopt(value_name = "FILE")]
-	/// Read tag to task ID mapping from this file.
 	task_ids: Option<PathBuf>,
 
+	/// List all non-completed tasks for active projects.
 	#[structopt(long)]
 	#[structopt(group = "action")]
-	/// List all non-completed tasks for active projects.
 	list_tasks: bool,
 
-	#[structopt(short, long)]
 	/// Read the Paymo API token from this file.
+	#[structopt(short, long)]
 	token: PathBuf,
 
+	/// Use this URL as the root for the Paymo API.
 	#[structopt(long)]
 	#[structopt(default_value = "https://app.paymoapp.com/api")]
-	/// Use this URL as the root for the Paymo API.
 	api_root: String,
 }
 
@@ -90,7 +102,13 @@ async fn do_main(options: Options) -> Result<(), ()> {
 	};
 
 	if let Some(file) = &options.sync {
-		sync_to_paymo(&api, &file, &options.task_ids.unwrap()).await
+		sync_to_paymo(
+			&api,
+			&file,
+			&options.task_ids.unwrap(),
+			&options.period.unwrap(),
+			options.dry_run
+		).await
 	} else if options.list_tasks {
 		list_tasks(&api).await
 	} else {
@@ -134,82 +152,76 @@ async fn list_tasks(api: &ApiClient) -> Result<(), ()> {
 }
 
 /// Synchronize logged hours to Paymo.
-async fn sync_to_paymo(api: &ApiClient, file: &Path, task_ids: &Path) -> Result<(), ()> {
+async fn sync_to_paymo(api: &ApiClient, file: &Path, task_ids: &Path, period: &PartialDate, dry_run: bool) -> Result<(), ()> {
+	let period = period.as_range();
+
 	// Read all entries from the hour log.
-	let entries = uurlog::parse_file(file)
-		.map_err(|e| eprintln!("Failed to read {}: {}", file.display(), e))?;
+	let mut entries = uurlog::parse_file(file)
+		.map_err(|e| log::error!("failed to read {}: {}", file.display(), e))?;
+
+	// Filter entries on period.
+	entries.retain(|entry| period.contains(&entry.date));
 
 	// Read the tag to task ID mapping from file.
 	let task_ids = parse_tasks::read_task_ids(task_ids)
-		.map_err(|e| eprintln!("Failed to read task IDs from {}: {}", task_ids.display(), e))?;
+		.map_err(|e| log::error!("failed to read task IDs from {}: {}", task_ids.display(), e))?;
 
 	// Get our Paymo user ID.
 	let user = api.my_user().await
-		.map_err(|e| eprintln!("Failed to determine user ID: {}", e))?;
+		.map_err(|e| log::error!("failed to determine user ID: {}", e))?;
 
 	// Find the right task ID with each hour log entry and index them by date.
-	let entries_with_tasks = get_tasks_with_entries(&entries, &task_ids)?;
-	let entries_by_date = index_by(entries_with_tasks, |(entry, _task_id)| entry.date);
+	let mut entries_with_tasks = get_tasks_with_entries(&entries, &task_ids)?;
+
+	// Get the existing entries for the period.
+	let old_entries = api.get_time_entries(&api_client::TimeEntryFilter::new().user_id(user.id).period(period.clone()))
+		.await
+		.map_err(|e| log::error!("failed to get time entries between {} and {}: {}", period.start, period.end, e))?;
+	log::debug!("found {} existing entries on server between {} and {}", old_entries.len(), period.start, period.end);
 
 	// Collect old entries to delete and new entries to add.
 	let mut delete_entries = Vec::new();
-	let mut upload_entries = Vec::new();
 
-	for (date, mut new_entries) in entries_by_date {
-		eprintln!("Processing {}", date);
+	for old_entry in &old_entries {
+		// See if there is a matching entry in our own hour log.
+		let matching_index = entries_with_tasks
+			.iter()
+			.position(|(new_entry, _task_id)| {
+				new_entry.description == old_entry.description
+				&& new_entry.hours.total_minutes() * 60 == old_entry.duration
+			});
 
-		// Get the entries for the right date.
-		// TODO: Be faster by getting all entries for the right time interval in one request.
-		let old_entries = api.get_time_entries(&api_client::TimeEntryFilter::new().user_id(user.id).date(date))
-			.await
-			.map_err(|e| eprintln!("failed to get time entries for {}: {}", date, e))?;
-
-		// Avoid hitting rate limits.
-		tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
-
-		for old_entry in &old_entries {
-			// Skip old entries with start/end time.
-			if old_entry.date.is_none() {
-				continue;
-			}
-
-			// See if there is a matching entry in our own hour log.
-			let matching_index = new_entries
-				.iter()
-				.position(|(new_entry, _task_id)| {
-					new_entry.description == old_entry.description
-					&& new_entry.hours.total_minutes() * 60 == old_entry.duration
-				});
-
-			// If there is, don't upload that entry.
-			if let Some(matching_index) = matching_index {
-				new_entries.remove(matching_index);
-			// If there isn't, delete the old entry.
-			} else {
-				delete_entries.push(old_entry.id);
-			}
+		// If there is, don't upload that entry.
+		if let Some(matching_index) = matching_index {
+			entries_with_tasks.remove(matching_index);
+		// If there isn't, delete the old entry.
+		} else {
+			delete_entries.push(old_entry);
 		}
-
-		// Add all remaining new entries to the upload list.
-		upload_entries.extend(new_entries);
 	}
 
 	// Delete all old entries without match in the log.
 	for &delete_entry in &delete_entries {
-		println!("Deleting entry {}", delete_entry);
-		api.delete_entry(delete_entry)
-			.await
-			.map_err(|e| eprintln!("{}", e))?;
-		tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+		let date = delete_entry.date.as_deref().or_else(|| delete_entry.start_time.as_deref()).unwrap_or("????");
+		let hours = uurlog::Hours::from_minutes(delete_entry.duration / 60);
+		log::warn!("Deleting entry {}: {}, {}, {}", delete_entry.id, date, hours, delete_entry.description);
+		if !dry_run {
+			api.delete_entry(delete_entry.id)
+				.await
+				.map_err(|e| log::error!("{}", e))?;
+			tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+		}
 	}
 
 	// Upload all new entries without existing entry on Paymo.
-	for &(entry, task_id) in &upload_entries {
-		println!("Adding entry with task id {}: {}", task_id, entry);
-		api.add_entry(task_id, entry.date, entry.hours, &entry.description)
-			.await
-			.map_err(|e| eprintln!("{}", e))?;
-		tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+	for &(entry, task_id) in &entries_with_tasks {
+		log::info!("Adding entry with task id {}: {}", task_id, entry);
+		if !dry_run {
+			api.add_entry(task_id, entry.date, entry.hours, &entry.description)
+				.await
+				.map_err(|e| log::error!("{}", e))?;
+			tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+		}
 	}
 
 	Ok(())
