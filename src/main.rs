@@ -87,7 +87,7 @@ fn init_logging(verbosity: i8) {
 		log::LevelFilter::Trace
 	};
 
-	env_logger::from_env("RUST_LOG").filter_module("uurlog_paymo", level).init();
+	env_logger::Builder::from_env("RUST_LOG").filter_module("uurlog_paymo", level).init();
 }
 
 async fn do_main(options: Options) -> Result<(), ()> {
@@ -104,7 +104,7 @@ async fn do_main(options: Options) -> Result<(), ()> {
 	if let Some(file) = &options.sync {
 		sync_to_paymo(
 			&api,
-			&file,
+			file,
 			&options.task_ids.unwrap(),
 			&options.period.unwrap(),
 			options.dry_run
@@ -202,14 +202,14 @@ async fn sync_to_paymo(api: &ApiClient, file: &Path, task_ids: &Path, period: &P
 
 	// Delete all old entries without match in the log.
 	for &delete_entry in &delete_entries {
-		let date = delete_entry.date.as_deref().or_else(|| delete_entry.start_time.as_deref()).unwrap_or("????");
+		let date = delete_entry.date.as_deref().or(delete_entry.start_time.as_deref()).unwrap_or("????");
 		let hours = uurlog::Hours::from_minutes(delete_entry.duration / 60);
 		log::warn!("Deleting entry {}: {}, {}, {}", delete_entry.id, date, hours, delete_entry.description);
 		if !dry_run {
 			api.delete_entry(delete_entry.id)
 				.await
 				.map_err(|e| log::error!("{}", e))?;
-			tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		}
 	}
 
@@ -220,7 +220,7 @@ async fn sync_to_paymo(api: &ApiClient, file: &Path, task_ids: &Path, period: &P
 			api.add_entry(task_id, entry.date, entry.hours, &entry.description)
 				.await
 				.map_err(|e| log::error!("{}", e))?;
-			tokio::time::delay_for(std::time::Duration::from_secs(1)).await;
+			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		}
 	}
 
@@ -234,7 +234,7 @@ fn get_tasks_with_entries<'a>(entries: &'a [uurlog::Entry], task_ids: &BTreeMap<
 	for entry in entries {
 		let task_id = if entry.tags.len() == 1 {
 			task_ids.get(&entry.tags[0]).ok_or_else(|| log::error!("unknown task ID for tag: {}", entry.tags[0]))?
-		} else if entry.tags.len() == 0 {
+		} else if entry.tags.is_empty() {
 			log::error!("entry has no tags, unable to determine project/task");
 			log::error!("  {}", entry);
 			return Err(());
