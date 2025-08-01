@@ -1,80 +1,71 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use structopt::StructOpt;
-use structopt::clap;
 
 mod api_client;
-mod parse_tasks;
+mod config;
 mod partial_date;
 mod types;
 
 use api_client::ApiClient;
 use partial_date::PartialDate;
 
-#[derive(StructOpt)]
-#[structopt(setting = clap::AppSettings::DeriveDisplayOrder)]
-#[structopt(setting = clap::AppSettings::UnifiedHelpMessage)]
-#[structopt(setting = clap::AppSettings::ColoredHelp)]
-#[structopt(group = clap::ArgGroup::with_name("action").required(true))]
+#[derive(clap::Parser)]
+#[clap(group = clap::ArgGroup::new("action").required(true))]
 struct Options {
-	#[structopt(long, short)]
-	#[structopt(parse(from_occurrences))]
-	verbose: i8,
+	/// Show more messages.
+	#[clap(long, short)]
+	#[clap(action= clap::ArgAction::Count)]
+	verbose: u8,
+
+	/// Show less messages.
+	#[clap(long, short)]
+	#[clap(action = clap::ArgAction::Count)]
+	quiet: u8,
+
+	/// Use the specified configuration file.
+	#[clap(long)]
+	#[clap(value_name = "FILE.toml")]
+	#[clap(default_value = "uurlog-paymo.toml")]
+	config: PathBuf,
 
 	/// Synchronize logged hours to Paymo.
-	#[structopt(long)]
-	#[structopt(value_name = "FILE")]
-	#[structopt(requires = "task-ids")]
-	#[structopt(requires = "period")]
-	#[structopt(group = "action")]
+	#[clap(long)]
+	#[clap(value_name = "FILE")]
+	#[clap(requires = "task-ids")]
+	#[clap(requires = "period")]
+	#[clap(group = "action")]
 	sync: Option<PathBuf>,
 
 	/// The period to synchronize.
-	#[structopt(value_name = "YYYY[-MM[-DD]]")]
-	#[structopt(long)]
+	#[clap(value_name = "YYYY[-MM[-DD]]")]
+	#[clap(long)]
 	period: Option<PartialDate>,
 
 	/// Print what would be done, without changing any entries on Paymo.
-	#[structopt(long)]
+	#[clap(long)]
 	dry_run: bool,
 
-	/// Read tag to task ID mapping from this file.
-	#[structopt(long)]
-	#[structopt(value_name = "FILE")]
-	task_ids: Option<PathBuf>,
 
 	/// List all non-completed tasks for active projects.
-	#[structopt(long)]
-	#[structopt(group = "action")]
+	#[clap(long)]
+	#[clap(group = "action")]
 	list_tasks: bool,
 
-	/// Read the Paymo API token from this file.
-	#[structopt(short, long)]
-	token: PathBuf,
-
 	/// Use this URL as the root for the Paymo API.
-	#[structopt(long)]
-	#[structopt(default_value = "https://app.paymoapp.com/api")]
+	#[clap(long)]
+	#[clap(default_value = "https://app.paymoapp.com/api")]
 	api_root: String,
 }
 
 #[tokio::main]
 async fn main() {
-	if do_main(Options::from_args()).await.is_err() {
+	if do_main(clap::Parser::parse()).await.is_err() {
 		std::process::exit(1);
 	}
 }
 
-/// Read a file to a string, with a potential final newline removed.
-fn read_file(path: impl AsRef<Path>) -> std::io::Result<String> {
-	let mut data = std::fs::read_to_string(path)?;
-	if data.ends_with('\n') {
-		data.pop();
-	}
-	Ok(data)
-}
-
-fn init_logging(verbosity: i8) {
+fn init_logging(verbose: u8, quiet: u8) {
+	let verbosity = i16::from(verbose) - i16::from(quiet);
 	let level = if verbosity <= -2 {
 		log::LevelFilter::Error
 	} else if verbosity == -1 {
@@ -91,21 +82,20 @@ fn init_logging(verbosity: i8) {
 }
 
 async fn do_main(options: Options) -> Result<(), ()> {
-	init_logging(options.verbose);
+	init_logging(options.verbose, options.quiet);
 
-	let token = read_file(&options.token)
-		.map_err(|e| log::error!("failed to read token from {}: {}", options.token.display(), e))?;
+	let config = config::Config::from_file(&options.config)?;
 
 	let api = ApiClient {
 		api_root: options.api_root,
-		auth_token: token,
+		auth_token: config.general.token.clone(),
 	};
 
 	if let Some(file) = &options.sync {
 		sync_to_paymo(
-			&api,
 			file,
-			&options.task_ids.unwrap(),
+			&config,
+			&api,
 			&options.period.unwrap(),
 			options.dry_run
 		).await
@@ -117,18 +107,18 @@ async fn do_main(options: Options) -> Result<(), ()> {
 }
 
 async fn list_tasks(api: &ApiClient) -> Result<(), ()> {
-	let mut clients = api.get_clients().await.map_err(|e| log::error!("{}", e))?;
+	let mut clients = api.get_clients().await.map_err(|e| log::error!("{e}"))?;
 	clients.sort_by(|a, b| a.name.cmp(&b.name));
 
 	// Get all active projects, and index them by client ID.
 	let filter = api_client::ProjectsFilter {
 		active: Some(true),
 	};
-	let projects = api.get_projects_filtered(&filter).await.map_err(|e| log::error!("{}", e))?;
+	let projects = api.get_projects_filtered(&filter).await.map_err(|e| log::error!("{e}"))?;
 	let projects_by_client_id = index_by(projects, |x| x.client_id);
 
 	// Get all tasks, and index them by project ID.
-	let tasks = api.get_tasks().await.map_err(|e| log::error!("{}", e))?;
+	let tasks = api.get_tasks().await.map_err(|e| log::error!("{e}"))?;
 	let tasks_by_project_id = index_by(tasks, |x| x.project_id);
 
 	// Print a tree of clients -> projects -> tasks.
@@ -152,7 +142,7 @@ async fn list_tasks(api: &ApiClient) -> Result<(), ()> {
 }
 
 /// Synchronize logged hours to Paymo.
-async fn sync_to_paymo(api: &ApiClient, file: &Path, task_ids: &Path, period: &PartialDate, dry_run: bool) -> Result<(), ()> {
+async fn sync_to_paymo(file: &Path, config: &config::Config, api: &ApiClient, period: &PartialDate, dry_run: bool) -> Result<(), ()> {
 	let period = period.as_range();
 
 	// Read all entries from the hour log.
@@ -163,20 +153,23 @@ async fn sync_to_paymo(api: &ApiClient, file: &Path, task_ids: &Path, period: &P
 	entries.retain(|entry| period.contains(&entry.date));
 
 	// Read the tag to task ID mapping from file.
-	let task_ids = parse_tasks::read_task_ids(task_ids)
-		.map_err(|e| log::error!("failed to read task IDs from {}: {}", task_ids.display(), e))?;
+	let task_ids = config.task_ids()?;
 
 	// Get our Paymo user ID.
 	let user = api.my_user().await
-		.map_err(|e| log::error!("failed to determine user ID: {}", e))?;
+		.map_err(|e| log::error!("failed to determine user ID: {e}"))?;
 
 	// Find the right task ID with each hour log entry and index them by date.
-	let mut entries_with_tasks = get_tasks_with_entries(&entries, &task_ids)?;
+	let mut entries_with_tasks = get_tasks_with_entries(entries, &task_ids)?;
+
+	if let Some(description) = &config.general.summarize_per_day {
+		entries_with_tasks = summarize_per_day(entries_with_tasks, description);
+	}
 
 	// Get the existing entries for the period.
 	let old_entries = api.get_time_entries(&api_client::TimeEntryFilter::new().user_id(user.id).period(period.clone()))
 		.await
-		.map_err(|e| log::error!("failed to get time entries between {} and {}: {}", period.start, period.end, e))?;
+		.map_err(|e| log::error!("failed to get time entries between {} and {}: {e}", period.start, period.end))?;
 	log::debug!("found {} existing entries on server between {} and {}", old_entries.len(), period.start, period.end);
 
 	// Collect old entries to delete and new entries to add.
@@ -208,18 +201,18 @@ async fn sync_to_paymo(api: &ApiClient, file: &Path, task_ids: &Path, period: &P
 		if !dry_run {
 			api.delete_entry(delete_entry.id)
 				.await
-				.map_err(|e| log::error!("{}", e))?;
+				.map_err(|e| log::error!("{e}"))?;
 			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		}
 	}
 
 	// Upload all new entries without existing entry on Paymo.
-	for &(entry, task_id) in &entries_with_tasks {
-		log::info!("Adding entry with task id {}: {}", task_id, entry);
+	for (entry, task_id) in &entries_with_tasks {
+		log::info!("Adding entry with task id {task_id}: {entry}");
 		if !dry_run {
-			api.add_entry(task_id, entry.date, entry.hours, &entry.description)
+			api.add_entry(*task_id, entry.date, entry.hours, &entry.description)
 				.await
-				.map_err(|e| log::error!("{}", e))?;
+				.map_err(|e| log::error!("{e}"))?;
 			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		}
 	}
@@ -228,26 +221,53 @@ async fn sync_to_paymo(api: &ApiClient, file: &Path, task_ids: &Path, period: &P
 }
 
 /// Find the right task ID for each entry.
-fn get_tasks_with_entries<'a>(entries: &'a [uurlog::Entry], task_ids: &BTreeMap<String, u64>) -> Result<Vec<(&'a uurlog::Entry, u64)>, ()> {
+fn get_tasks_with_entries(entries: Vec<uurlog::Entry>, task_ids: &BTreeMap<&str, u64>) -> Result<Vec<(uurlog::Entry, u64)>, ()> {
 	let mut result = Vec::new();
 
 	for entry in entries {
-		let task_id = if entry.tags.len() == 1 {
-			task_ids.get(&entry.tags[0]).ok_or_else(|| log::error!("unknown task ID for tag: {}", entry.tags[0]))?
-		} else if entry.tags.is_empty() {
-			log::error!("entry has no tags, unable to determine project/task");
-			log::error!("  {}", entry);
-			return Err(());
-		} else {
-			log::error!("entry has multiple tags, unable to determine project/task");
-			log::error!("  {}", entry);
-			return Err(());
-		};
+		let mut task_ids = entry.tags.iter()
+			.filter_map(|tag| Some((tag, task_ids.get(tag.as_str())?)));
+		let (task_tag, task_id) = task_ids.next()
+			.ok_or_else(|| {
+				log::error!("no tag found to determine the paymo project/task");
+				log::error!("  {entry}");
+			})?;
+
+		if let Some((other_tag, _id)) = task_ids.next() {
+			log::error!("multiple tags found that map to a paymo task: {task_tag} and {other_tag}");
+			log::error!("  {entry}");
+			return Err(())
+		}
 
 		result.push((entry, *task_id));
 	}
 
 	Ok(result)
+}
+
+fn summarize_per_day(entries: Vec<(uurlog::Entry, u64)>, description: &str) -> Vec<(uurlog::Entry, u64)> {
+	use std::collections::btree_map::Entry;
+
+	let mut output = BTreeMap::new();
+	for (entry, task) in entries {
+		match output.entry((entry.date, task)) {
+			Entry::Vacant(slot) => {
+				let summary_entry = uurlog::Entry {
+					date: entry.date,
+					hours: entry.hours,
+					tags: Vec::new(),
+					description: description.into(),
+				};
+				slot.insert((summary_entry, task));
+			},
+			Entry::Occupied(mut slot) => {
+				let (summary_entry, _task) = slot.get_mut();
+				summary_entry.hours += entry.hours;
+			},
+		}
+	}
+
+	output.into_values().collect()
 }
 
 /// Create an index for a sequence.
