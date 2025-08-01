@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod api_client;
 mod config;
@@ -10,51 +10,60 @@ use api_client::ApiClient;
 use partial_date::PartialDate;
 
 #[derive(clap::Parser)]
-#[clap(group = clap::ArgGroup::new("action").required(true))]
 struct Options {
 	/// Show more messages.
 	#[clap(long, short)]
-	#[clap(action= clap::ArgAction::Count)]
+	#[clap(global = true)]
+	#[clap(action = clap::ArgAction::Count)]
 	verbose: u8,
 
 	/// Show less messages.
 	#[clap(long, short)]
+	#[clap(global = true)]
 	#[clap(action = clap::ArgAction::Count)]
 	quiet: u8,
 
 	/// Use the specified configuration file.
 	#[clap(long)]
+	#[clap(global = true)]
 	#[clap(value_name = "FILE.toml")]
 	#[clap(default_value = "uurlog-paymo.toml")]
 	config: PathBuf,
 
+	/// Use this URL as the root for the Paymo API.
+	#[clap(long)]
+	#[clap(global = true)]
+	#[clap(default_value = "https://app.paymoapp.com/api")]
+	api_root: String,
+
+	#[clap(subcommand)]
+	command: Subcommand,
+}
+
+#[derive(clap::Subcommand)]
+enum Subcommand {
+	/// List available tasks (organized by client and project).
+	ListTasks,
+
 	/// Synchronize logged hours to Paymo.
-	#[clap(long)]
-	#[clap(value_name = "FILE")]
-	#[clap(requires = "task-ids")]
-	#[clap(requires = "period")]
-	#[clap(group = "action")]
-	sync: Option<PathBuf>,
+	Sync(SyncCommand),
+}
 
-	/// The period to synchronize.
-	#[clap(value_name = "YYYY[-MM[-DD]]")]
-	#[clap(long)]
-	period: Option<PartialDate>,
-
+#[derive(clap::Args)]
+struct SyncCommand {
 	/// Print what would be done, without changing any entries on Paymo.
 	#[clap(long)]
 	dry_run: bool,
 
-
-	/// List all non-completed tasks for active projects.
+	/// The period to synchronize.
 	#[clap(long)]
-	#[clap(group = "action")]
-	list_tasks: bool,
+	#[clap(value_name = "YYYY[-MM[-DD]]")]
+	period: PartialDate,
 
-	/// Use this URL as the root for the Paymo API.
-	#[clap(long)]
-	#[clap(default_value = "https://app.paymoapp.com/api")]
-	api_root: String,
+	/// Load the uurlog file to sync to Paymo.
+	#[clap(value_name = "FILE.uurlog")]
+	#[clap(required = true)]
+	hours: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -86,27 +95,23 @@ async fn do_main(options: Options) -> Result<(), ()> {
 
 	let config = config::Config::from_file(&options.config)?;
 
-	let api = ApiClient {
+	let mut api = ApiClient {
 		api_root: options.api_root,
 		auth_token: config.general.token.clone(),
+		rate_limit: api_client::RateLimit::new(),
 	};
 
-	if let Some(file) = &options.sync {
-		sync_to_paymo(
-			file,
-			&config,
-			&api,
-			&options.period.unwrap(),
-			options.dry_run
-		).await
-	} else if options.list_tasks {
-		list_tasks(&api).await
-	} else {
-		unreachable!("no action selected");
+	match &options.command {
+		Subcommand::ListTasks => {
+			list_tasks(&mut api).await
+		},
+		Subcommand::Sync(command) => {
+			sync_to_paymo(command, &config, &mut api).await
+		},
 	}
 }
 
-async fn list_tasks(api: &ApiClient) -> Result<(), ()> {
+async fn list_tasks(api: &mut ApiClient) -> Result<(), ()> {
 	let mut clients = api.get_clients().await.map_err(|e| log::error!("{e}"))?;
 	clients.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -142,12 +147,16 @@ async fn list_tasks(api: &ApiClient) -> Result<(), ()> {
 }
 
 /// Synchronize logged hours to Paymo.
-async fn sync_to_paymo(file: &Path, config: &config::Config, api: &ApiClient, period: &PartialDate, dry_run: bool) -> Result<(), ()> {
-	let period = period.as_range();
+async fn sync_to_paymo(command: &SyncCommand, config: &config::Config, api: &mut ApiClient) -> Result<(), ()> {
+	let period = command.period.as_range();
 
-	// Read all entries from the hour log.
-	let mut entries = uurlog::parse_file(file)
-		.map_err(|e| log::error!("failed to read {}: {}", file.display(), e))?;
+	// Read all entries from the hour logs.
+	let mut entries = Vec::new();
+	for file in &command.hours {
+		let file_entries = uurlog::parse_file(file)
+			.map_err(|e| log::error!("failed to read {}: {}", file.display(), e))?;
+		entries.extend(file_entries);
+	}
 
 	// Filter entries on period.
 	entries.retain(|entry| period.contains(&entry.date));
@@ -198,22 +207,20 @@ async fn sync_to_paymo(file: &Path, config: &config::Config, api: &ApiClient, pe
 		let date = delete_entry.date.as_deref().or(delete_entry.start_time.as_deref()).unwrap_or("????");
 		let hours = uurlog::Hours::from_minutes(delete_entry.duration / 60);
 		log::warn!("Deleting entry {}: {}, {}, {}", delete_entry.id, date, hours, delete_entry.description);
-		if !dry_run {
+		if !command.dry_run {
 			api.delete_entry(delete_entry.id)
 				.await
 				.map_err(|e| log::error!("{e}"))?;
-			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		}
 	}
 
 	// Upload all new entries without existing entry on Paymo.
 	for (entry, task_id) in &entries_with_tasks {
 		log::info!("Adding entry with task id {task_id}: {entry}");
-		if !dry_run {
+		if !command.dry_run {
 			api.add_entry(*task_id, entry.date, entry.hours, &entry.description)
 				.await
 				.map_err(|e| log::error!("{e}"))?;
-			tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 		}
 	}
 
